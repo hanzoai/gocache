@@ -162,11 +162,23 @@ everyone. The body digest check catches corruption, not a malicious writer.
 
 ## Enabling it
 
+### Installing it
+
+The repository is private, so `go install github.com/hanzoai/gocache@latest`
+needs `GOPRIVATE=github.com/hanzoai/*` and a credential for github.com — the
+same setup every other private hanzoai module needs. Without that, build it
+from a checkout:
+
+```sh
+git clone git@github.com:hanzoai/gocache && cd gocache && go build -o ~/bin/gocache .
+```
+
+There are no dependencies, so neither path touches the module proxy for
+anything but the module itself.
+
 ### Locally
 
 ```sh
-go install github.com/hanzoai/gocache@latest
-
 export GOCACHE_REMOTE='s3://go-build-cache/v1?endpoint=https://s3.hanzo.ai&region=us-east-1'
 export GOCACHE_KMS=gocache
 export KMS_CLIENT_ID=...      # machine identity, from `hanzo auth`
@@ -193,8 +205,13 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install gocache
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
         run: |
-          go install github.com/hanzoai/gocache@latest
+          # Private module: authenticate, then install. No dependencies, so
+          # this is one module fetch.
+          git config --global url."https://x-access-token:${GH_PAT}@github.com/".insteadOf "https://github.com/"
+          GOPRIVATE='github.com/hanzoai/*' GOFLAGS= go install github.com/hanzoai/gocache@latest
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Shared build cache
@@ -279,3 +296,23 @@ through that key does not currently reach a PaaS build.
 composition and the signer, plus end-to-end tests that run the real go command
 with `GOCACHEPROG` set against an in-process S3 server. The signer is checked
 against two published AWS signature vectors.
+
+## Checked against the production gateway
+
+Pointing gocache at `https://s3.hanzo.ai` with a deliberately wrong key returns:
+
+```
+Code: InvalidAccessKeyId
+Resource: /go-build-cache/v1/cc/cc54a1...
+BucketName: go-build-cache
+Key: v1/cc/cc54a1...
+```
+
+The gateway accepted the `AWS4-HMAC-SHA256` header, parsed the credential
+scope far enough to look the key up, and split the path-style URL into the
+right bucket and key. A malformed request would have come back as
+`AuthorizationHeaderMalformed` or `InvalidRequest` instead. The build itself
+finished normally with the shared tier rejecting every request.
+
+Not yet checked against production: a signature the gateway agrees with, since
+that needs a real key. The signature arithmetic is covered by the AWS vectors.
