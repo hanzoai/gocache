@@ -43,9 +43,15 @@ type Remote struct {
 	fails   atomic.Int64
 	tripped atomic.Bool
 
-	queue chan upload
-	done  chan struct{}
-	once  sync.Once
+	// queue is guarded because a send on a closed channel panics, and a panic
+	// in this program is a failed build. Offer holds it for reading, Drain for
+	// writing, so the close can never overtake a send in flight. Puts are
+	// already serialized by the protocol loop, so there is nothing to contend
+	// over.
+	qmu    sync.RWMutex
+	closed bool
+	queue  chan upload
+	done   chan struct{}
 
 	Hits, Misses, Fails, Uploads, Dropped atomic.Int64
 	DownBytes, UpBytes                    atomic.Int64
@@ -163,6 +169,11 @@ func (r *Remote) Offer(a, o ID, path string, size int64) {
 	if !r.write || !r.ok() || size > r.maxSize {
 		return
 	}
+	r.qmu.RLock()
+	defer r.qmu.RUnlock()
+	if r.closed {
+		return
+	}
 	select {
 	case r.queue <- upload{a, o, path, size}:
 	default:
@@ -205,7 +216,13 @@ func (r *Remote) upload(u upload) {
 // deadline. It is called after the go command has already been released, so
 // the wait delays nothing but this program's own exit.
 func (r *Remote) Drain(d time.Duration) {
-	r.once.Do(func() { close(r.queue) })
+	r.qmu.Lock()
+	if !r.closed {
+		r.closed = true
+		close(r.queue)
+	}
+	r.qmu.Unlock()
+
 	select {
 	case <-r.done:
 	case <-time.After(d):

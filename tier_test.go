@@ -463,3 +463,26 @@ func TestConcurrentGetsAndPuts(t *testing.T) {
 }
 
 func readFile(p string) ([]byte, error) { return os.ReadFile(p) }
+
+// Offering an upload while the queue is being drained must not panic. A send
+// on a closed channel would kill the process, and a dead cache program is a
+// failed build.
+func TestOfferDuringDrainIsSafe(t *testing.T) {
+	m := newMem()
+	tier, r := newTier(t, m, true)
+
+	var wg sync.WaitGroup
+	for i := range 32 {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			body := bytes.Repeat([]byte{byte(i)}, 32)
+			for range 50 {
+				tier.Put(id(byte(i)), outputOf(body), body)
+			}
+		}(i)
+	}
+	go r.Drain(2 * time.Second)
+	wg.Wait()
+	r.Drain(2 * time.Second) // idempotent
+}
