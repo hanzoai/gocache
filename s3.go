@@ -95,17 +95,21 @@ func statusError(res *http.Response) error {
 	return fmt.Errorf("s3: %s: %s", res.Status, strings.TrimSpace(string(msg)))
 }
 
-// hashFile returns the hex sha256 of prefix followed by the contents of path.
-func hashFile(prefix []byte, path string) (string, error) {
+// hashFile returns the hex sha256 of prefix followed by the contents of path,
+// and how many bytes of the file it read. The caller uses that count rather
+// than a remembered size, so a file that has been trimmed underneath us cannot
+// produce a request whose Content-Length disagrees with its body.
+func hashFile(prefix []byte, path string) (string, int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	defer f.Close()
 	h := sha256.New()
 	h.Write(prefix)
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
+	n, err := io.Copy(h, f)
+	if err != nil {
+		return "", 0, err
 	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return hex.EncodeToString(h.Sum(nil)), n, nil
 }

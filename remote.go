@@ -151,6 +151,11 @@ func (r *Remote) Get(a ID) (ID, []byte, bool) {
 	}
 	defer body.Close()
 
+	// An object that does not match its own digest counts against the failure
+	// budget, the same as a transport error. That is deliberate: a store
+	// handing out bytes that fail their integrity check is not healthy, and
+	// tripping early bounds how much of it a build looks at. The build is
+	// correct either way, because both paths compile locally.
 	out, data, err := readObject(body, r.maxSize)
 	if err != nil {
 		r.trip(err)
@@ -186,8 +191,10 @@ func (r *Remote) upload(u upload) {
 		return
 	}
 	head := header(u.output, u.size)
-	sum, err := hashFile(head, u.path)
-	if err != nil {
+	sum, n, err := hashFile(head, u.path)
+	if err != nil || n != u.size {
+		// The file is gone or no longer the size the record claims. Nothing to
+		// upload, and nothing broken about the shared tier.
 		r.Dropped.Add(1)
 		return
 	}
@@ -201,7 +208,7 @@ func (r *Remote) upload(u upload) {
 	ctx, cancel := context.WithTimeout(context.Background(), r.putDeadline)
 	defer cancel()
 
-	total := int64(len(head)) + u.size
+	total := int64(len(head)) + n
 	err = r.store.Put(ctx, r.key(u.action), total, io.MultiReader(bytes.NewReader(head), f), sum)
 	if err != nil {
 		r.trip(err)
