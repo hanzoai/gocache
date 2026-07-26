@@ -319,7 +319,7 @@ func newFakeS3(t *testing.T) *fakeS3 {
 				return
 			}
 			if f.corrupt.Load() && len(b) > 0 {
-				b = append(append([]byte{}, b...))
+				b = bytes.Clone(b)
 				b[len(b)-1] ^= 0xff
 			}
 			w.Write(b)
