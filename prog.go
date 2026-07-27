@@ -3,9 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
-	"fmt"
 	"io"
-	"os"
 	"sync"
 	"time"
 )
@@ -61,6 +59,14 @@ func (w *wire) send(res *response) {
 	w.bw.Flush()
 }
 
+// inflight bounds how many gets are in the air at once. It is also the reason
+// a broken shared tier is observed to fail more times than the breaker's limit:
+// every request already past the breaker's check when the first failure lands
+// still has to come back. The total is therefore bounded by limit + inflight,
+// which is a constant -- it does not grow with the size of the build, and that
+// is the property that matters.
+const inflight = 32
+
 // Serve runs the protocol until stdin closes or a close request arrives.
 func Serve(in io.Reader, out io.Writer, t *Tier) {
 	w := newWire(out)
@@ -71,7 +77,7 @@ func Serve(in io.Reader, out io.Writer, t *Tier) {
 
 	dec := json.NewDecoder(in)
 	var wg sync.WaitGroup
-	gate := make(chan struct{}, 32)
+	gate := make(chan struct{}, inflight)
 
 	for {
 		var req request
@@ -124,7 +130,7 @@ func Serve(in io.Reader, out io.Writer, t *Tier) {
 func handle(t *Tier, req request, body []byte) (res *response) {
 	defer func() {
 		if p := recover(); p != nil {
-			fmt.Fprintf(os.Stderr, "gocache: recovered in %s: %v\n", req.Command, p)
+			logf("recovered in %s: %v", req.Command, p)
 			res = &response{ID: req.ID, Miss: true}
 		}
 	}()

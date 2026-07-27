@@ -21,12 +21,17 @@
 //	GOCACHE_WRITE     1 to upload results         (default read-only)
 //	GOCACHE_KEY       access key, delivered from KMS by the environment
 //	GOCACHE_SECRET    secret key, delivered from KMS by the environment
-//	GOCACHE_KMS       KMS secret path to read the key pair from directly
+//	GOCACHE_SEAL      seal key, delivered from KMS by the environment
+//	GOCACHE_KMS       KMS secret path to read all three from directly
 //	GOCACHE_TIMEOUT   deadline per shared operation (default 3s)
 //	GOCACHE_MAX       largest object to share      (default 32M)
 //	GOCACHE_DRAIN     how long to finish uploads after the build (default 30s)
 //	GOCACHE_VERBOSE   1 to print cache statistics to stderr
 //	KMS_ADDR KMS_ORG KMS_ENV KMS_CLIENT_ID KMS_CLIENT_SECRET
+//
+// Nothing is written to stderr unless GOCACHE_VERBOSE is set. A shared tier that
+// is unreachable is meant to cost a developer nothing, and a line of
+// explanation on every build is not nothing.
 package main
 
 import (
@@ -39,13 +44,35 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
 
+// verbose gates everything this program writes to stderr. The go command's
+// stderr belongs to the build. A cache that cannot help must not editorialize:
+// a shared tier that is unreachable is supposed to cost a developer nothing,
+// and a line of explanation on every build for a week is not nothing. What
+// happened is available on request, in one statistics line, including why the
+// shared tier is off.
+var verbose bool
+
+func logf(format string, args ...any) {
+	if verbose {
+		fmt.Fprintf(os.Stderr, "gocache: "+format+"\n", args...)
+	}
+}
+
 func main() {
+	verbose = envBool("GOCACHE_VERBOSE")
+
 	// A panic here is a failed build in every repository that has the cache
 	// turned on. Nothing reaches the go command but the protocol.
+	//
+	// This one message is printed whether or not statistics were asked for.
+	// Reaching it means this program has a bug, the go command is about to
+	// abort the build over a cache program that vanished, and the developer
+	// deserves to know which one.
 	defer func() {
 		if p := recover(); p != nil {
 			fmt.Fprintf(os.Stderr, "gocache: %v\n", p)
@@ -70,26 +97,24 @@ func main() {
 		// network round trips, are resolved later.
 		cfg, err := parseRemote(dsn)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "gocache: %v; local only\n", err)
+			logf("%v; local only", err)
 		} else {
 			deadline := envDuration("GOCACHE_TIMEOUT", 3*time.Second)
-			lz := &lazy{ready: make(chan struct{})}
-			remote = NewRemote(lz, cfg.prefix, envBool("GOCACHE_WRITE"),
-				deadline, deadline*10, envSize("GOCACHE_MAX", 32<<20), 4, 3)
+			remote = NewRemote(Policy{
+				Prefix:  cfg.prefix,
+				Write:   envBool("GOCACHE_WRITE"),
+				Get:     deadline,
+				Put:     deadline * 10,
+				MaxSize: envSize("GOCACHE_MAX", 32<<20),
+				Workers: 4,
+				Limit:   3,
+			})
 			tier.remote = remote
 
 			// Resolving credentials happens behind the handshake, never in
 			// front of it: the go command waits for the capability line with
 			// no timeout of its own.
-			go func() {
-				key, secret, err := credentials()
-				if err != nil {
-					remote.Disable(err)
-				} else {
-					lz.store = cfg.store(key, secret)
-				}
-				close(lz.ready)
-			}()
+			go remote.Open(cfg.open())
 		}
 	}
 
@@ -103,45 +128,12 @@ func main() {
 	if remote != nil {
 		remote.Drain(envDuration("GOCACHE_DRAIN", 30*time.Second))
 	}
-	if envBool("GOCACHE_VERBOSE") {
+	// Trimming last, after the uploads that read these same files. Both cost
+	// the build nothing: the go command left when stdout closed.
+	disk.Trim(time.Now())
+	if verbose {
 		report(os.Stderr, tier, remote)
 	}
-}
-
-// lazy holds the place of a store that is still being constructed. Callers
-// block on it only until their own deadline, so a slow or failed setup costs a
-// bounded wait and then behaves like any other shared-tier failure.
-type lazy struct {
-	ready chan struct{}
-	store Store
-}
-
-func (l *lazy) wait(ctx context.Context) (Store, error) {
-	select {
-	case <-l.ready:
-		if l.store == nil {
-			return nil, errors.New("shared tier unavailable")
-		}
-		return l.store, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-}
-
-func (l *lazy) Get(ctx context.Context, key string) (io.ReadCloser, error) {
-	s, err := l.wait(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return s.Get(ctx, key)
-}
-
-func (l *lazy) Put(ctx context.Context, key string, size int64, body io.Reader, hash string) error {
-	s, err := l.wait(ctx)
-	if err != nil {
-		return err
-	}
-	return s.Put(ctx, key, size, body, hash)
 }
 
 // remoteConfig is everything the DSN says: where the shared tier is and which
@@ -190,30 +182,58 @@ func parseRemote(dsn string) (remoteConfig, error) {
 	return cfg, nil
 }
 
-func (c remoteConfig) store(key, secret string) Store {
-	return &S3{
-		HTTP:     &http.Client{Transport: transport()},
-		Endpoint: c.endpoint,
-		Bucket:   c.bucket,
-		Region:   c.region,
-		Key:      key,
-		Secret:   secret,
+// open resolves everything the shared tier needs before its first request. All
+// three secrets travel together and are required together: a cache that can
+// reach the store but cannot authenticate its objects would have to either
+// accept unsigned ones or reject every one, and both are worse than being off.
+func (c remoteConfig) open() (*session, error) {
+	k, err := secrets()
+	if err != nil {
+		return nil, err
 	}
+	if len(k.seal) < minSeal {
+		return nil, fmt.Errorf("seal key is %d bytes, need at least %d", len(k.seal), minSeal)
+	}
+	return &session{
+		store: &S3{
+			HTTP:     &http.Client{Transport: transport()},
+			Endpoint: c.endpoint,
+			Bucket:   c.bucket,
+			Region:   c.region,
+			Key:      k.access,
+			Secret:   k.secret,
+		},
+		sealKey: k.seal,
+	}, nil
 }
 
-// credentials never come from a file in a repository or a literal in this
-// program. Either the environment already carries them, because a KMS-synced
-// secret put them there, or this asks KMS directly with a machine identity.
-func credentials() (string, string, error) {
-	if k, s := os.Getenv("GOCACHE_KEY"), os.Getenv("GOCACHE_SECRET"); k != "" && s != "" {
-		return k, s, nil
+// minSeal is the shortest seal key worth having. Anything shorter is a
+// placeholder somebody meant to replace, and the whole point of the key is that
+// guessing it is not an option.
+const minSeal = 16
+
+// keys is what the shared tier is unlocked with: two for the store, one for the
+// objects in it.
+type keys struct {
+	access string
+	secret string
+	seal   []byte
+}
+
+// secrets never come from a file in a repository or a literal in this program.
+// Either the environment already carries them, because a KMS-synced secret put
+// them there, or this asks KMS directly with a machine identity.
+func secrets() (keys, error) {
+	a, s, k := os.Getenv("GOCACHE_KEY"), os.Getenv("GOCACHE_SECRET"), os.Getenv("GOCACHE_SEAL")
+	if a != "" && s != "" && k != "" {
+		return keys{a, s, []byte(k)}, nil
 	}
 	path := env("GOCACHE_KMS", "gocache")
 	id, secret := os.Getenv("KMS_CLIENT_ID"), os.Getenv("KMS_CLIENT_SECRET")
 	if id == "" || secret == "" {
-		return "", "", errors.New("no credentials: set GOCACHE_KEY and GOCACHE_SECRET, or KMS_CLIENT_ID and KMS_CLIENT_SECRET")
+		return keys{}, errors.New("no credentials: set GOCACHE_KEY, GOCACHE_SECRET and GOCACHE_SEAL, or KMS_CLIENT_ID and KMS_CLIENT_SECRET")
 	}
-	k := kms{
+	kms := kms{
 		addr:   strings.TrimRight(env("KMS_ADDR", "https://kms.hanzo.ai"), "/"),
 		org:    env("KMS_ORG", "hanzo"),
 		env:    env("KMS_ENV", "prod"),
@@ -223,7 +243,12 @@ func credentials() (string, string, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	return k.pair(ctx, path, "access-key", "secret-key")
+
+	v, err := kms.read(ctx, path, "access-key", "secret-key", "seal-key")
+	if err != nil {
+		return keys{}, err
+	}
+	return keys{v[0], v[1], []byte(v[2])}, nil
 }
 
 // transport keeps connections warm across the thousands of actions in a build
@@ -245,10 +270,17 @@ func report(w io.Writer, t *Tier, r *Remote) {
 	local, shared, miss := t.Local.Load(), t.Shared.Load(), t.Misses.Load()
 	total := local + shared + miss
 	fmt.Fprintf(w, "gocache: %d gets, %d local, %d shared, %d miss\n", total, local, shared, miss)
-	if r != nil {
-		fmt.Fprintf(w, "gocache: shared %d hit, %d miss, %d fail, %d up, %d dropped, %dK down, %dK up, disabled=%v\n",
-			r.Hits.Load(), r.Misses.Load(), r.Fails.Load(), r.Uploads.Load(), r.Dropped.Load(),
-			r.DownBytes.Load()>>10, r.UpBytes.Load()>>10, r.tripped.Load())
+	if r == nil {
+		return
+	}
+	fmt.Fprintf(w, "gocache: shared %d hit, %d miss, %d fail, %d up, %d dropped, %dK down, %dK up\n",
+		r.Hits.Load(), r.Misses.Load(), r.Fails.Load(), r.Uploads.Load(), r.Dropped.Load(),
+		r.DownBytes.Load()>>10, r.UpBytes.Load()>>10)
+	// The reason, not just the fact. A shared tier that quietly stopped helping
+	// is the failure mode this program is most likely to have in production,
+	// and one line here is the difference between noticing and not.
+	if why := r.Why(); why != "" {
+		fmt.Fprintf(w, "gocache: shared tier off: %s\n", why)
 	}
 }
 
@@ -299,4 +331,25 @@ func envSize(k string, def int64) int64 {
 		return def
 	}
 	return n
+}
+
+// parseSize accepts a plain byte count or one with a K/M/G suffix.
+func parseSize(s string) (int64, error) {
+	if s == "" {
+		return 0, errors.New("empty size")
+	}
+	mult := int64(1)
+	switch s[len(s)-1] {
+	case 'k', 'K':
+		mult, s = 1<<10, s[:len(s)-1]
+	case 'm', 'M':
+		mult, s = 1<<20, s[:len(s)-1]
+	case 'g', 'G':
+		mult, s = 1<<30, s[:len(s)-1]
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return n * mult, nil
 }
