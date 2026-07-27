@@ -89,19 +89,20 @@ func (k kms) get(ctx context.Context, token, path, key string) (string, error) {
 	return out.Value, nil
 }
 
-// pair reads two keys from one secret path in a single authenticated session.
-func (k kms) pair(ctx context.Context, path, a, b string) (string, string, error) {
+// read fetches several keys from one secret path in a single authenticated
+// session, in order. All of them or none: the shared tier needs every one of
+// its secrets, so a path missing any of them is a path that leaves the cache
+// off rather than half configured.
+func (k kms) read(ctx context.Context, path string, keys ...string) ([]string, error) {
 	tok, err := k.token(ctx)
 	if err != nil {
-		return "", "", err
+		return nil, err
 	}
-	av, err := k.get(ctx, tok, path, a)
-	if err != nil {
-		return "", "", err
+	out := make([]string, len(keys))
+	for i, key := range keys {
+		if out[i], err = k.get(ctx, tok, path, key); err != nil {
+			return nil, err
+		}
 	}
-	bv, err := k.get(ctx, tok, path, b)
-	if err != nil {
-		return "", "", err
-	}
-	return av, bv, nil
+	return out, nil
 }

@@ -1,22 +1,19 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
 // Remote is the shared tier, wrapped in the policy that keeps a build
-// independent of it. Three rules, and every one of them exists because the go
+// independent of it. Four rules, and every one of them exists because the go
 // command treats this program as infrastructure: it aborts the build if we
 // crash, hang, or answer nonsense.
 //
@@ -27,21 +24,24 @@ import (
 //     limit x deadline in total rather than that much per action.
 //  3. Uploads go through a bounded queue and are dropped when it is full.
 //     A put never waits on the network.
+//  4. Credentials are resolved behind the handshake, and waiting for them is
+//     bounded by the same deadline as any other operation. A wedged KMS is
+//     just another unreachable shared tier.
 //
 // The result: with the shared tier unreachable, the build runs at exactly
 // local-disk speed and produces exactly the same bytes.
 type Remote struct {
-	store  Store
-	prefix string
-	write  bool
+	Policy
 
-	getDeadline time.Duration
-	putDeadline time.Duration
-	maxSize     int64
-	limit       int64
+	// ready is closed once the session has been resolved, successfully or not.
+	// session is written before the close and read only after it, so the close
+	// is what publishes it.
+	ready   chan struct{}
+	session *session
 
 	fails   atomic.Int64
 	tripped atomic.Bool
+	why     atomic.Pointer[string]
 
 	// queue is guarded because a send on a closed channel panics, and a panic
 	// in this program is a failed build. Offer holds it for reading, Drain for
@@ -57,6 +57,26 @@ type Remote struct {
 	DownBytes, UpBytes                    atomic.Int64
 }
 
+// Policy is what the shared tier does not learn from the network: where its
+// keyspace is, whether it may write, and how much time and space it is allowed.
+type Policy struct {
+	Prefix  string
+	Write   bool
+	Get     time.Duration
+	Put     time.Duration
+	MaxSize int64
+	Workers int
+	Limit   int64
+}
+
+// session is what the shared tier cannot start without and cannot get locally:
+// somewhere to talk to, and the key that says which objects are ours. Both come
+// from KMS, together, after the handshake.
+type session struct {
+	store   Store
+	sealKey []byte
+}
+
 type upload struct {
 	action ID
 	output ID
@@ -64,28 +84,17 @@ type upload struct {
 	size   int64
 }
 
-// magic prefixes every shared object. It carries the format version so a
-// future change of layout cannot be misread as a corrupt object.
-const magic = "gocache1"
+var errNoSession = errors.New("no credentials for the shared tier")
 
-// maxHeader bounds the header scan, so a hostile or truncated object cannot
-// make the reader allocate without limit.
-const maxHeader = 256
-
-func NewRemote(s Store, prefix string, write bool, getDeadline, putDeadline time.Duration, maxSize int64, workers int, limit int64) *Remote {
+func NewRemote(p Policy) *Remote {
 	r := &Remote{
-		store:       s,
-		prefix:      prefix,
-		write:       write,
-		getDeadline: getDeadline,
-		putDeadline: putDeadline,
-		maxSize:     maxSize,
-		limit:       limit,
-		queue:       make(chan upload, 256),
-		done:        make(chan struct{}),
+		Policy: p,
+		ready:  make(chan struct{}),
+		queue:  make(chan upload, 256),
+		done:   make(chan struct{}),
 	}
 	var wg sync.WaitGroup
-	for range workers {
+	for range p.Workers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -98,13 +107,39 @@ func NewRemote(s Store, prefix string, write bool, getDeadline, putDeadline time
 	return r
 }
 
+// Open supplies what the shared tier has been waiting for, or the reason it
+// will never arrive. Exactly one call, and it releases everything blocked on
+// the gate either way: a failure to resolve credentials must not leave a build
+// waiting.
+func (r *Remote) Open(s *session, err error) {
+	if err != nil {
+		r.Disable(err)
+	} else {
+		r.session = s
+	}
+	close(r.ready)
+}
+
+// use returns the session, waiting no longer than the caller's deadline allows.
+func (r *Remote) use(ctx context.Context) (*session, error) {
+	select {
+	case <-r.ready:
+		if r.session == nil {
+			return nil, errNoSession
+		}
+		return r.session, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 func (r *Remote) key(a ID) string {
 	s := a.String()
 	b := s
 	if len(s) >= 2 {
 		b = s[:2]
 	}
-	return r.prefix + "/" + b + "/" + s
+	return r.Prefix + "/" + b + "/" + s
 }
 
 func (r *Remote) ok() bool { return !r.tripped.Load() }
@@ -114,8 +149,19 @@ func (r *Remote) ok() bool { return !r.tripped.Load() }
 // once rather than failing every action in turn.
 func (r *Remote) Disable(err error) {
 	if r.tripped.CompareAndSwap(false, true) {
-		fmt.Fprintf(os.Stderr, "gocache: shared tier off: %v\n", err)
+		s := err.Error()
+		r.why.Store(&s)
 	}
+}
+
+// Why reports what turned the shared tier off, for the statistics line. A
+// developer whose cache stopped helping should be able to find out in one
+// command rather than by reading this program.
+func (r *Remote) Why() string {
+	if s := r.why.Load(); s != nil {
+		return *s
+	}
+	return ""
 }
 
 // pass records a healthy answer. A miss is a healthy answer: an empty shared
@@ -124,22 +170,28 @@ func (r *Remote) pass() { r.fails.Store(0) }
 
 func (r *Remote) trip(err error) {
 	r.Fails.Add(1)
-	if r.fails.Add(1) >= r.limit && r.tripped.CompareAndSwap(false, true) {
-		fmt.Fprintf(os.Stderr, "gocache: shared tier disabled after %d failures: %v\n", r.limit, err)
+	if r.fails.Add(1) >= r.Limit {
+		r.Disable(fmt.Errorf("%d consecutive failures, last: %w", r.Limit, err))
 	}
 }
 
 // Get fetches an action result from the shared tier. Every failure mode,
-// including a corrupt or forged object, returns a miss: the build then
-// compiles the action locally, which is always correct.
+// including a corrupt or forged object, returns a miss: the build then compiles
+// the action locally, which is always correct.
 func (r *Remote) Get(a ID) (ID, []byte, bool) {
 	if !r.ok() {
 		return nil, nil, false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), r.getDeadline)
+	ctx, cancel := context.WithTimeout(context.Background(), r.Policy.Get)
 	defer cancel()
 
-	body, err := r.store.Get(ctx, r.key(a))
+	s, err := r.use(ctx)
+	if err != nil {
+		r.trip(err)
+		return nil, nil, false
+	}
+
+	body, err := s.store.Get(ctx, r.key(a))
 	if errors.Is(err, ErrMiss) {
 		r.pass()
 		r.Misses.Add(1)
@@ -151,12 +203,12 @@ func (r *Remote) Get(a ID) (ID, []byte, bool) {
 	}
 	defer body.Close()
 
-	// An object that does not match its own digest counts against the failure
-	// budget, the same as a transport error. That is deliberate: a store
-	// handing out bytes that fail their integrity check is not healthy, and
-	// tripping early bounds how much of it a build looks at. The build is
-	// correct either way, because both paths compile locally.
-	out, data, err := readObject(body, r.maxSize)
+	// An object that fails its digest or its MAC counts against the failure
+	// budget, the same as a transport error. That is deliberate: a store handing
+	// out objects this cache did not produce is not healthy, and tripping early
+	// bounds how many of them a build looks at. The build is correct either way,
+	// because both paths compile locally.
+	out, data, err := read(body, s.sealKey, a, r.MaxSize)
 	if err != nil {
 		r.trip(err)
 		return nil, nil, false
@@ -171,7 +223,7 @@ func (r *Remote) Get(a ID) (ID, []byte, bool) {
 // reports failure: an upload that does not happen costs a future cache miss,
 // and a build that waits on an upload costs the developer.
 func (r *Remote) Offer(a, o ID, path string, size int64) {
-	if !r.write || !r.ok() || size > r.maxSize {
+	if !r.Write || !r.ok() || size > r.MaxSize {
 		return
 	}
 	r.qmu.RLock()
@@ -190,11 +242,30 @@ func (r *Remote) upload(u upload) {
 	if !r.ok() {
 		return
 	}
-	head := header(u.output, u.size)
-	sum, n, err := hashFile(head, u.path)
-	if err != nil || n != u.size {
+	ctx, cancel := context.WithTimeout(context.Background(), r.Policy.Put)
+	defer cancel()
+
+	s, err := r.use(ctx)
+	if err != nil {
+		r.trip(err)
+		return
+	}
+
+	// Three passes over a file that was written moments ago and is still in the
+	// page cache: the MAC, then the request signature over header and body,
+	// then the body itself. The signature covers the header, and the header
+	// carries the MAC, so they cannot be computed in one pass. All of it runs
+	// after the go command has been released.
+	mac, err := sealFile(s.sealKey, u.action, u.output, u.size, u.path)
+	if err != nil {
 		// The file is gone or no longer the size the record claims. Nothing to
 		// upload, and nothing broken about the shared tier.
+		r.Dropped.Add(1)
+		return
+	}
+	head := object(u.output, u.size, mac)
+	sum, n, err := hashFile(head, u.path)
+	if err != nil || n != u.size {
 		r.Dropped.Add(1)
 		return
 	}
@@ -205,11 +276,8 @@ func (r *Remote) upload(u upload) {
 	}
 	defer f.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), r.putDeadline)
-	defer cancel()
-
 	total := int64(len(head)) + n
-	err = r.store.Put(ctx, r.key(u.action), total, io.MultiReader(bytes.NewReader(head), f), sum)
+	err = s.store.Put(ctx, r.key(u.action), total, io.MultiReader(bytes.NewReader(head), f), sum)
 	if err != nil {
 		r.trip(err)
 		return
@@ -220,8 +288,8 @@ func (r *Remote) upload(u upload) {
 }
 
 // Drain stops accepting uploads and waits for the queued ones, up to a
-// deadline. It is called after the go command has already been released, so
-// the wait delays nothing but this program's own exit.
+// deadline. It is called after the go command has already been released, so the
+// wait delays nothing but this program's own exit.
 func (r *Remote) Drain(d time.Duration) {
 	r.qmu.Lock()
 	if !r.closed {
@@ -234,72 +302,4 @@ func (r *Remote) Drain(d time.Duration) {
 	case <-r.done:
 	case <-time.After(d):
 	}
-}
-
-// header is the one line that precedes the body in a shared object:
-// magic, output digest, byte count.
-func header(o ID, size int64) []byte {
-	return fmt.Appendf(nil, "%s %s %d\n", magic, o, size)
-}
-
-// readObject parses a shared object and verifies it. The digest check is the
-// integrity boundary of this program: bytes arriving from shared storage are
-// only handed to the compiler once sha256(body) matches the output ID the
-// object claims, so neither corruption at rest nor a tampered body can reach a
-// build intact. It does not authenticate the producer -- that is what
-// write-scoped credentials are for.
-func readObject(rc io.Reader, max int64) (ID, []byte, error) {
-	br := bufio.NewReader(io.LimitReader(rc, max+maxHeader))
-	line, err := br.ReadString('\n')
-	if err != nil {
-		return nil, nil, fmt.Errorf("header: %w", err)
-	}
-	if len(line) > maxHeader {
-		return nil, nil, errors.New("header too long")
-	}
-	var kind, digest string
-	var size int64
-	if _, err := fmt.Sscan(line, &kind, &digest, &size); err != nil {
-		return nil, nil, fmt.Errorf("header: %w", err)
-	}
-	if kind != magic {
-		return nil, nil, fmt.Errorf("bad magic %q", kind)
-	}
-	if size < 0 || size > max {
-		return nil, nil, fmt.Errorf("size %d out of range", size)
-	}
-	out, err := parseID(digest)
-	if err != nil {
-		return nil, nil, fmt.Errorf("output id: %w", err)
-	}
-
-	body := make([]byte, size)
-	if _, err := io.ReadFull(br, body); err != nil {
-		return nil, nil, fmt.Errorf("body: %w", err)
-	}
-	if sum := sha256.Sum256(body); !bytes.Equal(sum[:], out) {
-		return nil, nil, errors.New("body does not match its output id")
-	}
-	return out, body, nil
-}
-
-// parseSize accepts a plain byte count or one with a K/M/G suffix.
-func parseSize(s string) (int64, error) {
-	if s == "" {
-		return 0, errors.New("empty size")
-	}
-	mult := int64(1)
-	switch s[len(s)-1] {
-	case 'k', 'K':
-		mult, s = 1<<10, s[:len(s)-1]
-	case 'm', 'M':
-		mult, s = 1<<20, s[:len(s)-1]
-	case 'g', 'G':
-		mult, s = 1<<30, s[:len(s)-1]
-	}
-	n, err := strconv.ParseInt(s, 10, 64)
-	if err != nil {
-		return 0, err
-	}
-	return n * mult, nil
 }

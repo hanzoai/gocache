@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"bytes"
-	"crypto/sha256"
 	"encoding/json"
 	"io"
 	"strings"
@@ -261,22 +260,6 @@ func TestUnknownCommandIsReported(t *testing.T) {
 	}
 	if _, ok := res[2]; !ok {
 		t.Error("conversation did not continue after an unknown command")
-	}
-}
-
-func TestReadObjectRejectsOversizeClaim(t *testing.T) {
-	body := []byte("small")
-	o := sha256.Sum256(body)
-	obj := append(header(o[:], 1<<40), body...)
-	if _, _, err := readObject(bytes.NewReader(obj), 1<<20); err == nil {
-		t.Error("an object claiming a terabyte was accepted")
-	}
-}
-
-func TestReadObjectRejectsLongHeader(t *testing.T) {
-	obj := append([]byte(magic+" "+strings.Repeat("a", 4096)+" 1\n"), 'x')
-	if _, _, err := readObject(bytes.NewReader(obj), 1<<20); err == nil {
-		t.Error("an object with a 4KB header line was accepted")
 	}
 }
 

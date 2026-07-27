@@ -85,14 +85,19 @@ func (m *mem) Put(ctx context.Context, key string, size int64, body io.Reader, h
 func hexOf(b []byte) string { return ID(b).String() }
 
 // seed writes an object directly into the shared tier, as another machine's
-// build would have left it.
+// build would have left it: correctly sealed for the action it is stored under.
 func (m *mem) seed(prefix string, a ID, body []byte) {
-	o := sha256.Sum256(body)
-	obj := append(header(o[:], int64(len(body))), body...)
 	s := a.String()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.data[prefix+"/"+s[:2]+"/"+s] = obj
+	m.data[prefix+"/"+s[:2]+"/"+s] = honest(a, body)
+}
+
+// open is the shared tier as it looks once credentials have arrived.
+func open(s Store, p Policy) *Remote {
+	r := NewRemote(p)
+	r.Open(&session{store: s, sealKey: sealKey}, nil)
+	return r
 }
 
 func newTier(t *testing.T, s Store, write bool) (*Tier, *Remote) {
@@ -104,7 +109,11 @@ func newTier(t *testing.T, s Store, write bool) (*Tier, *Remote) {
 	if s == nil {
 		return &Tier{disk: d}, nil
 	}
-	r := NewRemote(s, "p", write, 2*time.Second, 5*time.Second, 32<<20, 2, 3)
+	r := open(s, Policy{
+		Prefix: "p", Write: write,
+		Get: 2 * time.Second, Put: 5 * time.Second,
+		MaxSize: 32 << 20, Workers: 2, Limit: 3,
+	})
 	return &Tier{disk: d, remote: r}, r
 }
 
@@ -295,7 +304,7 @@ func TestHangingSharedTierCostsBoundedTime(t *testing.T) {
 		t.Fatal(err)
 	}
 	const deadline = 200 * time.Millisecond
-	r := NewRemote(m, "p", false, deadline, deadline, 32<<20, 2, 3)
+	r := open(m, Policy{Prefix: "p", Get: deadline, Put: deadline, MaxSize: 32 << 20, Workers: 2, Limit: 3})
 	tier := &Tier{disk: d, remote: r}
 
 	start := time.Now()
@@ -407,7 +416,7 @@ func TestOversizeStaysLocal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := NewRemote(m, "p", true, time.Second, time.Second, 1024, 2, 3)
+	r := open(m, Policy{Prefix: "p", Write: true, Get: time.Second, Put: time.Second, MaxSize: 1024, Workers: 2, Limit: 3})
 	tier := &Tier{disk: d, remote: r}
 
 	body := bytes.Repeat([]byte("b"), 4096)

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"fmt"
 	"net"
 	"net/http"
@@ -18,6 +19,24 @@ import (
 
 // These tests run the real go command against the built binary. They are the
 // only ones that prove the thing that matters: that a build finishes.
+
+// Every go command these tests start gets its own GOCACHE, never the machine's.
+// A test suite for a build cache must not touch the build cache the machine is
+// using: other work on the same box reads that directory, and a suite that
+// writes to it can turn someone else's build red -- or, far worse, green against
+// artifacts they never built.
+//
+// The directory is under TMPDIR, so pointing TMPDIR at a tmpfs keeps the whole
+// suite off the shared disk. It is left in place between runs on purpose: it
+// costs one cold compile to create and nothing after that.
+func isolatedCache(t *testing.T) string {
+	t.Helper()
+	dir := filepath.Join(os.TempDir(), "gocache-test-gocache")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
 
 func goTool(t *testing.T) string {
 	t.Helper()
@@ -41,6 +60,7 @@ var (
 
 func gocacheBinary(t *testing.T) string {
 	t.Helper()
+	cache := isolatedCache(t)
 	buildOnce.Do(func() {
 		dir, err := os.MkdirTemp("", "gocache-bin-")
 		if err != nil {
@@ -49,7 +69,8 @@ func gocacheBinary(t *testing.T) string {
 		}
 		buildPath = filepath.Join(dir, "gocache")
 		cmd := exec.Command(goTool(t), "build", "-o", buildPath, ".")
-		cmd.Env = append(os.Environ(), "GOWORK=off", "GOTOOLCHAIN=local")
+		cmd.Env = append(os.Environ(), "GOWORK=off", "GOTOOLCHAIN=local",
+			"GOCACHE="+cache, "GOCACHEPROG=")
 		if out, err := cmd.CombinedOutput(); err != nil {
 			buildErr = fmt.Errorf("building gocache: %v\n%s", err, out)
 		}
@@ -97,13 +118,26 @@ func F%d(s string) string { return fmt.Sprint(strings.ToUpper(s), %d) }
 type buildEnv struct {
 	cacheDir string
 	remote   string
-	key      string
-	secret   string
+	creds    bool // supply the three secrets the shared tier needs
 	write    bool
 	verbose  bool
+	timeout  string
 }
 
-func runBuild(t *testing.T, mod string, e buildEnv) (time.Duration, string) {
+// outcome is one build: what a person waited for, what the machine actually
+// spent, and everything written to the build's output.
+//
+// The two times answer different questions. Wall time is what a developer
+// experiences and is worthless on a machine with other tenants. CPU covers the
+// go command and every compiler it reaps, so work genuinely avoided shows up
+// there no matter how busy the box is.
+type outcome struct {
+	wall time.Duration
+	cpu  time.Duration
+	out  string
+}
+
+func runBuild(t *testing.T, mod string, e buildEnv) outcome {
 	t.Helper()
 	bin := gocacheBinary(t)
 	// A multi-package build needs a directory to write into.
@@ -116,18 +150,29 @@ func runBuild(t *testing.T, mod string, e buildEnv) (time.Duration, string) {
 		"GOWORK=off",
 		"GOTOOLCHAIN=local",
 		"GOFLAGS=",
+		// Never the machine's cache. With GOCACHEPROG set the go command uses
+		// this only for its fuzz directory, but a test suite for a build cache
+		// has no business anywhere near the build cache other work depends on.
+		"GOCACHE="+isolatedCache(t),
 		"GOCACHEPROG="+bin,
 		"GOCACHE_DIR="+e.cacheDir,
 		"GOCACHE_REMOTE="+e.remote,
-		"GOCACHE_KEY="+e.key,
-		"GOCACHE_SECRET="+e.secret,
-		"GOCACHE_TIMEOUT=2s",
+		"GOCACHE_TIMEOUT="+cmp.Or(e.timeout, "2s"),
 		"GOCACHE_DRAIN=20s",
 		// Keep the test hermetic: no ambient machine identity, so nothing
 		// reaches out to a real KMS.
 		"KMS_CLIENT_ID=",
 		"KMS_CLIENT_SECRET=",
 	)
+	if e.creds {
+		// The three secrets arrive together or not at all, which is the same
+		// rule production runs under.
+		env = append(env,
+			"GOCACHE_KEY=an-access-key",
+			"GOCACHE_SECRET=a-secret-key",
+			"GOCACHE_SEAL="+string(sealKey),
+		)
+	}
 	if e.write {
 		env = append(env, "GOCACHE_WRITE=1")
 	}
@@ -138,16 +183,59 @@ func runBuild(t *testing.T, mod string, e buildEnv) (time.Duration, string) {
 	cmd := exec.Command(goTool(t), "build", "-o", out, "./...")
 	cmd.Dir = mod
 	cmd.Env = env
-	var buf bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &buf, &buf
+
+	// A real file, not an in-memory buffer. Handed a buffer, exec.Cmd makes a
+	// pipe and copies from it, and Wait returns only once every writer has
+	// closed that pipe -- including this cache program, which outlives the go
+	// command deliberately. Timing a build through such a pipe would time the
+	// uploads and the trim as well: exactly the work the design moves off the
+	// build's critical path. A file has no such rendezvous, so what is measured
+	// here is what a developer waits for.
+	log, err := os.CreateTemp(t.TempDir(), "build-log-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer log.Close()
+	cmd.Stdout, cmd.Stderr = log, log
 
 	start := time.Now()
-	err := cmd.Run()
+	err = cmd.Run()
 	elapsed := time.Since(start)
-	if err != nil {
-		t.Fatalf("go build failed: %v\n%s", err, buf.String())
+
+	var cpu time.Duration
+	if st := cmd.ProcessState; st != nil {
+		cpu = st.UserTime() + st.SystemTime()
 	}
-	return elapsed, buf.String()
+
+	if e.verbose {
+		// Statistics are the last thing written, after the uploads. Waiting for
+		// them happens after the build has already been timed.
+		awaitStats(t, log.Name())
+	} else {
+		// Nothing is expected on this path, so there is no line to wait for. A
+		// short settle turns "nothing yet" into "nothing at all", which is what
+		// makes the silence test able to fail.
+		time.Sleep(500 * time.Millisecond)
+	}
+	b, _ := os.ReadFile(log.Name())
+	if err != nil {
+		t.Fatalf("go build failed: %v\n%s", err, b)
+	}
+	return outcome{wall: elapsed, cpu: cpu, out: string(b)}
+}
+
+// awaitStats waits for the cache program to finish and report. It is the only
+// place a test waits on that process, and never before a measurement.
+func awaitStats(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(path); err == nil && strings.Contains(string(b), " gets,") {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Error("the cache program never reported statistics")
 }
 
 // The go command accepts this program as its cache and completes a build with
@@ -155,14 +243,14 @@ func runBuild(t *testing.T, mod string, e buildEnv) (time.Duration, string) {
 func TestBuildWithLocalTierOnly(t *testing.T) {
 	mod := scratch(t)
 	dir := t.TempDir()
-	_, out := runBuild(t, mod, buildEnv{cacheDir: dir, verbose: true})
-	if strings.Contains(out, "panic") {
-		t.Fatalf("cache program panicked:\n%s", out)
+	r := runBuild(t, mod, buildEnv{cacheDir: dir, verbose: true})
+	if strings.Contains(r.out, "panic") {
+		t.Fatalf("cache program panicked:\n%s", r.out)
 	}
-	if !strings.Contains(out, "gocache: ") {
-		t.Errorf("no statistics reported:\n%s", out)
+	if !strings.Contains(r.out, "gocache: ") {
+		t.Errorf("no statistics reported:\n%s", r.out)
 	}
-	t.Logf("%s", strings.TrimSpace(out))
+	t.Logf("%s", strings.TrimSpace(r.out))
 }
 
 // A build populates the shared tier; a second machine, with an empty local
@@ -174,26 +262,26 @@ func TestBuildSharesResultsAcrossMachines(t *testing.T) {
 	mod := scratch(t)
 
 	// Machine one: cold everywhere, uploads what it compiles.
-	_, out1 := runBuild(t, mod, buildEnv{
-		cacheDir: t.TempDir(), remote: shared.dsn, key: "k", secret: "s",
+	one := runBuild(t, mod, buildEnv{
+		cacheDir: t.TempDir(), remote: shared.dsn, creds: true,
 		write: true, verbose: true,
 	})
-	t.Logf("machine one: %s", stats(out1))
+	t.Logf("machine one: %s", stats(one.out))
 	if shared.puts.Load() == 0 {
 		t.Fatal("nothing was uploaded to the shared tier")
 	}
 
 	// Machine two: empty local tier, same source. Everything it needs is in
 	// the shared tier.
-	_, out2 := runBuild(t, mod, buildEnv{
-		cacheDir: t.TempDir(), remote: shared.dsn, key: "k", secret: "s",
+	two := runBuild(t, mod, buildEnv{
+		cacheDir: t.TempDir(), remote: shared.dsn, creds: true,
 		verbose: true,
 	})
-	t.Logf("machine two: %s", stats(out2))
+	t.Logf("machine two: %s", stats(two.out))
 
-	hits := field(out2, "shared,")
+	hits := field(two.out, "shared,")
 	if hits == 0 {
-		t.Fatalf("machine two got nothing from the shared tier:\n%s", out2)
+		t.Fatalf("machine two got nothing from the shared tier:\n%s", two.out)
 	}
 	t.Logf("machine two served %d actions from the shared tier", hits)
 }
@@ -225,15 +313,123 @@ func TestBuildSurvivesBrokenSharedTier(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			mod := scratch(t)
-			elapsed, out := runBuild(t, mod, buildEnv{
+			r := runBuild(t, mod, buildEnv{
 				cacheDir: t.TempDir(), remote: c.remote,
-				key: "k", secret: "s", write: true, verbose: true,
+				creds: true, write: true, verbose: true,
 			})
-			if strings.Contains(out, "panic") {
-				t.Fatalf("cache program panicked:\n%s", out)
+			if strings.Contains(r.out, "panic") {
+				t.Fatalf("cache program panicked:\n%s", r.out)
 			}
-			t.Logf("built in %v with a %s shared tier; %s", elapsed.Round(time.Millisecond), c.name, stats(out))
+			t.Logf("built in %v with a %s shared tier; %s", r.wall.Round(time.Millisecond), c.name, stats(r.out))
 		})
+	}
+}
+
+// The most important test here. A shared tier that hangs -- accepts the
+// connection and then never answers, which is what a wedged gateway, a
+// blackholed route or a saturated store looks like -- must not slow the build
+// down. A build tool that can stall every engineer at once is worse than no
+// build tool, so this asserts a bound rather than reporting a number.
+//
+// Three bounds. Two are exact and hold on any machine; the third is wall time,
+// which on a shared box is mostly noise and is therefore given a wide budget.
+//
+//   - The shared tier is consulted a constant number of times, not once per
+//     action. The constant is limit+inflight, because every request already past
+//     the breaker's check when the first failure lands still has to come back.
+//     What matters is that it does not grow with the build.
+//   - CPU is unchanged. Waiting on a socket costs no CPU, so a hung shared tier
+//     must not add any. This is the assertion that survives a loaded machine.
+//   - Wall time stays within the breaker's own bound plus slack.
+func TestHangingSharedTierDoesNotSlowTheBuild(t *testing.T) {
+	black := blackhole(t)
+	defer black.Close()
+
+	const deadline = time.Second
+	mod := scratch(t)
+
+	// What this build costs with no shared tier at all.
+	base := runBuild(t, mod, buildEnv{cacheDir: t.TempDir(), timeout: "1s"})
+
+	// The same build, equally cold, against a tier that never answers.
+	hung := runBuild(t, mod, buildEnv{
+		cacheDir: t.TempDir(),
+		remote:   "s3://b/v1?endpoint=http://" + black.Addr().String(),
+		creds:    true, write: true, verbose: true, timeout: "1s",
+	})
+
+	if strings.Contains(hung.out, "panic") {
+		t.Fatalf("cache program panicked:\n%s", hung.out)
+	}
+	if !strings.Contains(hung.out, "shared tier off") {
+		t.Errorf("a hung shared tier was never disabled:\n%s", hung.out)
+	}
+
+	gets, fails := field(hung.out, "gets,"), field(hung.out, "fail,")
+	if max := 3 + inflight; fails > max {
+		t.Errorf("a hung shared tier was waited on %d times, want at most %d", fails, max)
+	}
+	if gets > 0 && fails >= gets {
+		t.Errorf("every one of %d actions waited on the hung shared tier; the breaker did nothing", gets)
+	}
+
+	// Waiting on a dead socket is not work. Anything more than a small margin
+	// here would mean the cache is burning CPU on a tier that cannot answer.
+	if base.cpu > 0 && hung.cpu > base.cpu*3/2 {
+		t.Errorf("a hung shared tier cost %v of CPU against %v without one",
+			hung.cpu.Round(time.Millisecond), base.cpu.Round(time.Millisecond))
+	}
+
+	budget := 3*deadline + 20*time.Second
+	if over := hung.wall - base.wall - budget; over > 0 {
+		t.Errorf("build took %v against a hung shared tier and %v without one: %v over the %v budget\n%s",
+			hung.wall.Round(time.Millisecond), base.wall.Round(time.Millisecond),
+			over.Round(time.Millisecond), budget, hung.out)
+	}
+	t.Logf("wall: %v local-only, %v hung. cpu: %v local-only, %v hung. %d of %d actions reached the tier. %s",
+		base.wall.Round(time.Millisecond), hung.wall.Round(time.Millisecond),
+		base.cpu.Round(time.Millisecond), hung.cpu.Round(time.Millisecond),
+		fails, gets, stats(hung.out))
+}
+
+// Silence is a feature. Absent GOCACHE_VERBOSE this program must write nothing
+// at all, even when the shared tier is misconfigured or dead: the go command's
+// stderr belongs to the build, and a cache that cannot help has nothing to say.
+// A line of explanation on every build is how a tool teaches people to distrust
+// it.
+func TestNothingIsPrintedWithoutVerbose(t *testing.T) {
+	black := blackhole(t)
+	defer black.Close()
+
+	mod := scratch(t)
+	for name, remote := range map[string]string{
+		"no shared tier":  "",
+		"hangs":           "s3://b/v1?endpoint=http://" + black.Addr().String(),
+		"garbage address": "not-a-url-at-all",
+	} {
+		t.Run(name, func(t *testing.T) {
+			// Read-only, so there is nothing to drain and the cache program
+			// exits with the build rather than outliving it.
+			r := runBuild(t, mod, buildEnv{
+				cacheDir: t.TempDir(), remote: remote,
+				creds: true, timeout: "1s",
+			})
+			if strings.Contains(r.out, "gocache") {
+				t.Errorf("wrote to the build's output without being asked:\n%s", r.out)
+			}
+		})
+	}
+}
+
+// A real build leaves a bounded cache behind: the trim ran, so the directory has
+// a ceiling rather than growing for as long as the machine keeps building.
+func TestARealBuildTrimsItsCache(t *testing.T) {
+	mod := scratch(t)
+	dir := t.TempDir()
+	runBuild(t, mod, buildEnv{cacheDir: dir, verbose: true})
+
+	if _, err := os.Stat(filepath.Join(dir, "trim")); err != nil {
+		t.Errorf("no trim stamp after a build: %v", err)
 	}
 }
 
@@ -244,17 +440,17 @@ func TestBuildWithoutCredentials(t *testing.T) {
 	defer shared.Close()
 	mod := scratch(t)
 
-	_, out := runBuild(t, mod, buildEnv{
+	r := runBuild(t, mod, buildEnv{
 		cacheDir: t.TempDir(), remote: shared.dsn, verbose: true,
 		// no key, no secret, and no KMS identity in the environment
 	})
-	if strings.Contains(out, "panic") {
-		t.Fatalf("cache program panicked:\n%s", out)
+	if strings.Contains(r.out, "panic") {
+		t.Fatalf("cache program panicked:\n%s", r.out)
 	}
-	if !strings.Contains(out, "shared tier off") {
-		t.Errorf("missing credentials were not reported:\n%s", out)
+	if !strings.Contains(r.out, "shared tier off") {
+		t.Errorf("missing credentials were not reported:\n%s", r.out)
 	}
-	t.Logf("%s", stats(out))
+	t.Logf("%s", stats(r.out))
 }
 
 // A shared tier that serves corrupt objects must not corrupt the build.
@@ -266,18 +462,18 @@ func TestBuildIgnoresCorruptSharedObjects(t *testing.T) {
 	mod := scratch(t)
 	// Populate first with a healthy tier.
 	shared.corrupt.Store(false)
-	runBuild(t, mod, buildEnv{cacheDir: t.TempDir(), remote: shared.dsn, key: "k", secret: "s", write: true})
+	runBuild(t, mod, buildEnv{cacheDir: t.TempDir(), remote: shared.dsn, creds: true, write: true})
 
 	// Now corrupt everything on the way out and build from an empty local tier.
 	shared.corrupt.Store(true)
-	_, out := runBuild(t, mod, buildEnv{cacheDir: t.TempDir(), remote: shared.dsn, key: "k", secret: "s", verbose: true})
-	if strings.Contains(out, "panic") {
-		t.Fatalf("cache program panicked:\n%s", out)
+	r := runBuild(t, mod, buildEnv{cacheDir: t.TempDir(), remote: shared.dsn, creds: true, verbose: true})
+	if strings.Contains(r.out, "panic") {
+		t.Fatalf("cache program panicked:\n%s", r.out)
 	}
-	if got := field(out, "shared,"); got != 0 {
+	if got := field(r.out, "shared,"); got != 0 {
 		t.Errorf("%d corrupt objects were accepted, want 0", got)
 	}
-	t.Logf("corrupt shared tier: %s", stats(out))
+	t.Logf("corrupt shared tier: %s", stats(r.out))
 }
 
 // fakeS3 is an S3-compatible object store in memory. It checks that every
